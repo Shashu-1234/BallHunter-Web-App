@@ -1,4 +1,4 @@
-const HF_MODULE = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm';
+const HF_MODULE = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
 const CLIP_MODEL = 'Xenova/clip-vit-base-patch32';
 const SAM_MODEL = 'Xenova/slimsam-77-uniform';
 
@@ -33,27 +33,47 @@ async function loadHF() {
   return hf;
 }
 
+async function loadVisionWithFallback(lib, progress) {
+  const attempts = navigator.gpu
+    ? [
+        { device: 'webgpu', dtype: 'q4f16', label: 'WebGPU q4f16' },
+        { device: 'wasm', dtype: 'q8', label: 'WASM q8 fallback' },
+      ]
+    : [{ device: 'wasm', dtype: 'q8', label: 'WASM q8' }];
+  let lastError;
+  for (const a of attempts) {
+    try {
+      progress({ phase: 'runtime', text: `Trying ${a.label}` });
+      const model = await lib.CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, {
+        device: a.device,
+        dtype: a.dtype,
+        progress_callback: p => progress({ phase: 'model', detail: p }),
+      });
+      device = a.device;
+      return model;
+    } catch (e) {
+      lastError = e;
+      progress({ phase: 'runtime-fallback', text: `${a.label} unavailable — trying fallback` });
+      console.warn('BallHunter AI runtime attempt failed:', a, e);
+    }
+  }
+  throw lastError || new Error('No supported neural runtime found');
+}
+
 async function init(progress = () => {}) {
   if (visionModel && visionProcessor) return { device };
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const lib = await loadHF();
-    device = navigator.gpu ? 'webgpu' : 'wasm';
-    progress({ phase: 'runtime', text: device === 'webgpu' ? 'WebGPU detected' : 'Using WASM/CPU fallback' });
     visionProcessor = await lib.AutoProcessor.from_pretrained(CLIP_MODEL, {
-      progress_callback: p => progress({ phase: 'processor', detail: p })
+      progress_callback: p => progress({ phase: 'processor', detail: p }),
     });
-    const dtype = device === 'webgpu' ? 'q4f16' : 'q8';
-    visionModel = await lib.CLIPVisionModelWithProjection.from_pretrained(CLIP_MODEL, {
-      device,
-      dtype,
-      progress_callback: p => progress({ phase: 'model', detail: p })
-    });
+    visionModel = await loadVisionWithFallback(lib, progress);
     progress({ phase: 'ready', text: `Neural re-ID ready · ${device.toUpperCase()}` });
     return { device };
   })();
   try { return await initPromise; }
-  catch (e) { initPromise = null; throw e; }
+  catch (e) { initPromise = null; visionModel = null; throw e; }
 }
 
 async function embedCanvas(canvas) {
@@ -85,6 +105,31 @@ async function similarity(canvas) {
   return { raw, score: clamp((raw - 0.28) / 0.56) };
 }
 
+async function loadSamWithFallback(lib, progress) {
+  const attempts = device === 'webgpu'
+    ? [
+        { device: 'webgpu', dtype: 'fp16', label: 'WebGPU fp16' },
+        { device: 'wasm', dtype: 'q8', label: 'WASM q8 fallback' },
+      ]
+    : [{ device: 'wasm', dtype: 'q8', label: 'WASM q8' }];
+  let lastError;
+  for (const a of attempts) {
+    try {
+      progress({ phase: 'sam-runtime', text: `Mask refiner: ${a.label}` });
+      const model = await lib.SamModel.from_pretrained(SAM_MODEL, {
+        device: a.device,
+        dtype: a.dtype,
+        progress_callback: p => progress({ phase: 'sam-model', detail: p }),
+      });
+      return model;
+    } catch (e) {
+      lastError = e;
+      console.warn('BallHunter SlimSAM runtime attempt failed:', a, e);
+    }
+  }
+  throw lastError || new Error('No supported SlimSAM runtime found');
+}
+
 async function initSegmenter(progress = () => {}) {
   if (samModel && samProcessor) return true;
   if (samPromise) return samPromise;
@@ -92,18 +137,14 @@ async function initSegmenter(progress = () => {}) {
     const lib = await loadHF();
     progress({ phase: 'sam-loading', text: 'Loading neural mask refiner' });
     samProcessor = await lib.AutoProcessor.from_pretrained(SAM_MODEL, {
-      progress_callback: p => progress({ phase: 'sam-processor', detail: p })
+      progress_callback: p => progress({ phase: 'sam-processor', detail: p }),
     });
-    samModel = await lib.SamModel.from_pretrained(SAM_MODEL, {
-      device,
-      dtype: device === 'webgpu' ? 'fp16' : 'q8',
-      progress_callback: p => progress({ phase: 'sam-model', detail: p })
-    });
+    samModel = await loadSamWithFallback(lib, progress);
     progress({ phase: 'sam-ready', text: 'SlimSAM mask refiner ready' });
     return true;
   })();
   try { return await samPromise; }
-  catch (e) { samPromise = null; throw e; }
+  catch (e) { samPromise = null; samModel = null; throw e; }
 }
 
 async function segmentCandidate(canvas, progress = () => {}) {
@@ -143,5 +184,5 @@ export const BallHunterAI = {
   setReferenceCanvases,
   similarity,
   segmentCandidate,
-  get status() { return { ready: !!visionModel, samReady: !!samModel, device, references: referenceEmbeddings.length }; }
+  get status() { return { ready: !!visionModel, samReady: !!samModel, device, references: referenceEmbeddings.length }; },
 };
